@@ -1,0 +1,4 @@
+bin/
+.DS_Store
+.devin/mcp_config.local.json
+__pycache__/

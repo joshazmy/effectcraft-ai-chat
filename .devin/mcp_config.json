@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "effectcraft": {
+      "command": "effectcraft-cli",
+      "args": ["mcp", "--autosave", "--demo"]
+    },
+    "effectcraft-app": {
+      "command": "effectcraft-cli",
+      "args": ["mcp", "--bridge", "9877"]
+    }
+  }
+}
