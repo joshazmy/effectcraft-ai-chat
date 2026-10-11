@@ -60,7 +60,12 @@ scripts inside the running app, which does load the user's settings.)
 - Requests block while the agent generates (the app waits). Known limitation.
 - Ollama shape: `POST /api/chat {"model","stream":false,"messages":[…]}` →
   `{"message":{"content":…}}`; `Content-Length`, `Connection: close`.
-- Bridge API: `GET /agents`, `POST /chat {agent, messages}` → `{reply}` / `{error}`.
+- Bridge API: `GET /agents`, `POST /chat {agent, messages, model?}` →
+  `{reply, model?}` / `{error}`. `model` overrides ollama/openai `model`, fills a
+  command agent's `model_args` (`{model}` placeholder), and for ACP agents is
+  matched against the `configOptions` from `session/new` (`category:"model"`,
+  fallback `id:"model"`) and set with `session/set_config_option`; `pick_model`
+  in agent-bridge.py holds the matching rule.
 
 ## Rules
 

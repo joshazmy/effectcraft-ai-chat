@@ -11,7 +11,8 @@ Run:    python3 bridge/agent-bridge.py --config bridge/agents.json
 List:   python3 bridge/agent-bridge.py --config bridge/agents.json --list
 API:    GET  /health            -> {"ok": true}
         GET  /agents            -> {"agents": [{"id","label","kind","ready","note"}]}
-        POST /chat              -> {"agent": id, "messages": [...]} -> {"reply": "..."}
+        POST /chat              -> {"agent": id, "messages": [...], "model"?: name}
+                                  -> {"reply": "...", "model"?: "<the model that answered>"}
                                   errors come back as {"error": "..."}
 
 Config (bridge/agents.json — copy agents.example.json and edit):
@@ -21,12 +22,17 @@ Config (bridge/agents.json — copy agents.example.json and edit):
   kinds:
     ollama  {url, model}                 local /api/chat
     openai  {base_url, model, key}       OpenAI-compatible; key: env:NAME | pass:NAME
-    command {command: ["...", "{prompt}", ...], cwd?, timeout?, env?}
+    command {command: ["...", "{prompt}", ...], model_args?, cwd?, timeout?, env?}
     acp     {command: ["devin", "acp"], cwd?, timeout?}
 
 `{prompt}` is replaced by the conversation text in that one argument. `command`
 and `acp` agents get the whole transcript every turn (they keep no session
-state here). Everything binds 127.0.0.1 only; message contents are never logged.
+state here). A request's optional "model" overrides an ollama/openai agent's
+configured model; for `command` agents it is substituted into `model_args`
+(["-m", "{model}"]) appended to the argv, and for `acp` agents it is matched
+against the models the agent offers (e.g. "opus" -> the first Claude Opus) and
+set with `session/set_config_option`. Everything binds 127.0.0.1 only; message
+contents are never logged.
 """
 import argparse
 import json
@@ -81,23 +87,25 @@ def scratch_dir(agent):
 
 # ---------------------------------------------------------------------- kinds
 
-def run_ollama(agent, messages):
-    body = {"model": agent.get("model", "llama3.2:3b"), "stream": False, "messages": messages}
+def run_ollama(agent, messages, model):
+    m = model or agent.get("model", "llama3.2:3b")
+    body = {"model": m, "stream": False, "messages": messages}
     j = http_json(agent.get("url", "http://127.0.0.1:11434").rstrip("/") + "/api/chat", body)
-    return (j.get("message") or {}).get("content", "") or "(empty reply)"
+    return (j.get("message") or {}).get("content", "") or "(empty reply)", m
 
 
-def run_openai(agent, messages):
+def run_openai(agent, messages, model):
     key = resolve_key(agent.get("key"))
     if not key:
         raise RuntimeError("no API key (key: env:NAME or pass:NAME)")
+    m = model or agent.get("model", "gpt-4o-mini")
     url = agent.get("base_url", "https://api.openai.com/v1").rstrip("/") + "/chat/completions"
-    j = http_json(url, {"model": agent.get("model", "gpt-4o-mini"), "messages": messages, "stream": False},
+    j = http_json(url, {"model": m, "messages": messages, "stream": False},
                   {"Authorization": "Bearer " + key})
-    return j["choices"][0]["message"]["content"]
+    return j["choices"][0]["message"]["content"], m
 
 
-def run_command(agent, messages):
+def run_command(agent, messages, model):
     argv = agent.get("command")
     if not argv:
         raise RuntimeError("no command configured")
@@ -105,12 +113,18 @@ def run_command(agent, messages):
         raise RuntimeError(argv[0] + " is not installed")
     prompt = messages_to_text(messages)
     argv = [str(part).replace("{prompt}", prompt) for part in argv]
+    if model:
+        args = agent.get("model_args")
+        if not args:
+            raise RuntimeError("%s can't switch models (add model_args to its config)"
+                               % agent.get("label", agent["id"]))
+        argv += [str(part).replace("{model}", model) for part in args]
     env = {**os.environ, **(agent.get("env") or {})}
     p = subprocess.run(argv, capture_output=True, text=True, timeout=agent.get("timeout", 300),
                        cwd=scratch_dir(agent), env=env, stdin=subprocess.DEVNULL)
     if p.returncode != 0:
         raise RuntimeError(((p.stderr or "") + (p.stdout or "")).strip()[-500:] or "exit %d" % p.returncode)
-    return p.stdout.strip() or "(empty reply)"
+    return p.stdout.strip() or "(empty reply)", model
 
 
 class AcpAgent:
@@ -189,7 +203,32 @@ class AcpAgent:
             self.proc.kill()
 
 
-def run_acp(agent, messages):
+def pick_model(config_options, requested):
+    """The model to ask an ACP agent for, out of the `configOptions` it returned from
+    `session/new`: the option with `category == "model"` (or, failing that, `id == "model"`).
+    An exact value match (case-insensitive) wins; otherwise the first option whose value or
+    name contains the request, in list order ("opus" -> the first Claude Opus). Returns
+    (configId, value). Raises RuntimeError when there is no model option or no match."""
+    options = config_options or []
+    opt = next((o for o in options if o.get("category") == "model"), None)
+    if opt is None:
+        opt = next((o for o in options if o.get("id") == "model"), None)
+    if opt is None:
+        raise RuntimeError("doesn't offer a model choice")
+    choices = opt.get("options") or []
+    want = str(requested).lower()
+    chosen = next((o for o in choices if str(o.get("value", "")).lower() == want), None)
+    if chosen is None:
+        chosen = next((o for o in choices
+                       if want in str(o.get("value", "")).lower() or want in str(o.get("name", "")).lower()),
+                      None)
+    if chosen is None:
+        avail = ", ".join(str(o.get("value")) for o in choices[:8]) or "none"
+        raise RuntimeError("offers no model %r (available: %s)" % (requested, avail))
+    return opt.get("id"), chosen.get("value")
+
+
+def run_acp(agent, messages, model):
     argv = agent.get("command") or ["devin", "acp"]
     if shutil.which(argv[0]) is None:
         raise RuntimeError(argv[0] + " is not installed")
@@ -202,11 +241,19 @@ def run_acp(agent, messages):
         session_id = session.get("sessionId")
         if not session_id:
             raise RuntimeError("the agent opened no session (not authenticated?)")
+        resolved = None
+        if model:
+            try:
+                config_id, resolved = pick_model(session.get("configOptions"), model)
+            except RuntimeError as e:
+                raise RuntimeError("%s %s" % (agent.get("label", agent["id"]), e)) from e
+            acp.call("session/set_config_option",
+                     {"sessionId": session_id, "configId": config_id, "value": resolved})
         chunks = []
         acp.call("session/prompt", {"sessionId": session_id,
                                     "prompt": [{"type": "text", "text": messages_to_text(messages)}]},
                  collect=chunks)
-        return "".join(chunks).strip() or "(empty reply)"
+        return "".join(chunks).strip() or "(empty reply)", resolved
     finally:
         acp.close()
 
@@ -280,11 +327,18 @@ class Handler(BaseHTTPRequestHandler):
         agent = self.agents.get(req.get("agent"))
         if not agent:
             return self._json(200, {"error": "unknown agent %r" % req.get("agent")})
+        model = req.get("model")
+        model = str(model).strip() if model is not None else ""
+        model = model or None
         t0 = time.time()
         try:
-            reply = RUNNERS[agent.get("kind", "command")](agent, req.get("messages") or [])
-            print("[bridge] %s ok %.1fs" % (agent["id"], time.time() - t0), file=sys.stderr, flush=True)
-            return self._json(200, {"reply": reply})
+            reply, resolved = RUNNERS[agent.get("kind", "command")](agent, req.get("messages") or [], model)
+            print("[bridge] %s%s ok %.1fs" % (agent["id"], " model=%s" % resolved if resolved else "",
+                                              time.time() - t0), file=sys.stderr, flush=True)
+            out = {"reply": reply}
+            if resolved:
+                out["model"] = resolved
+            return self._json(200, out)
         except Exception as e:  # surface every failure to the panel
             print("[bridge] %s error: %s" % (agent["id"], e), file=sys.stderr, flush=True)
             return self._json(200, {"error": str(e)})

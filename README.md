@@ -53,6 +53,25 @@ The four adapters above are verified working (see Testing): a local model, Codex
 with a ChatGPT plan, Devin over ACP, and OpenCode — each answered through the
 bridge on the maintainer's machine.
 
+## Pick a model
+
+In the EffectCraft AI Chat panel, click **Settings** (or **Settings ▸ AI Chat**)
+and set **Agent Model** — Agent Default, Claude Opus, Claude Sonnet, Claude
+Haiku, GPT or Gemini. The panel sends the choice with each chat request and the
+bridge resolves it per agent kind:
+
+- `ollama` / `openai`: the request's model overrides the configured `model`.
+- `command`: the model is substituted into the agent's `model_args`
+  (`["-m", "{model}"]`, appended to the argv). An agent without `model_args`
+  answers "can't switch models".
+- `acp`: the model is matched against what the agent offered in
+  `session/new` — an exact value match, else the first option whose value or
+  name contains it (`opus` → the first Claude Opus) — and applied with
+  `session/set_config_option`.
+
+The reply reports the model that answered, shown in the panel's status line
+(e.g. `ready · claude-opus-5-5-medium`).
+
 ## How it works
 
 ```
