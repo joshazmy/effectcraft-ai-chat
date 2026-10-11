@@ -1,4 +1,5 @@
 bin/
 .DS_Store
 .devin/mcp_config.local.json
+bridge/agents.json
 __pycache__/
